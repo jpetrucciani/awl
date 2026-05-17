@@ -1,0 +1,102 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  release:
+    types:
+      - published
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to build and publish, for example v0.1.0
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build and publish, for example v0.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build ${{ matrix.asset }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: awl-linux-amd64
+            verify_static: true
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            asset: awl-linux-aarch64
+            verify_static: true
+          - runner: ubuntu-latest
+            target: x86_64-pc-windows-gnu
+            asset: awl-windows-amd64.exe
+            verify_static: false
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            asset: awl-macos-aarch64
+            verify_static: false
+    env:
+      TAG_NAME: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
+      - uses: cachix/install-nix-action@v31
+      - name: Build binary
+        run: |
+          version="${TAG_NAME#v}"
+          nix-shell --run "release_artifacts $version ${{ matrix.target }}"
+          mkdir -p release-out
+          cp "dist/v$version/${{ matrix.asset }}" release-out/
+      - name: Verify Linux static binary
+        if: matrix.verify_static
+        run: |
+          asset="release-out/${{ matrix.asset }}"
+          file "$asset"
+          file "$asset" | grep -q 'statically linked'
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: release-out/${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      TAG_NAME: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: release-files
+          merge-multiple: true
+      - name: Write checksums
+        working-directory: release-files
+        run: sha256sum awl-* > SHA256SUMS
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-files/*
+          tag_name: ${{ env.TAG_NAME }}
+          make_latest: true
+          generate_release_notes: true
+          overwrite_files: true

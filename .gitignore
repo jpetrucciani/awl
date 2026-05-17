@@ -1,0 +1,45 @@
+# nix
+.db
+.direnv
+result*
+tmp
+nixcache.log
+blob
+
+# rust
+debug/
+target/
+**/*.rs.bk
+*.pdb
+.zig-cache/
+
+# local runtime/build output
+.awl-local/
+dist/
+
+# Logs
+logs
+*.log
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# python
+ruff.json
+.ruff_cache
+.pytest_cache
+__pycache__/
+*.py[cod]
