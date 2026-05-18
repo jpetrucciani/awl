@@ -60,6 +60,11 @@ let
       python3 tools/extract_ec2_types.py "$@"
     '';
 
+    update_lock = writers.writeBashBin "update_lock" ''
+      set -euo pipefail
+      cargo update -p awl-cli --offline
+    '';
+
     quality = writers.writeBashBin "quality" ''
       set -euo pipefail
       cargo fmt --check

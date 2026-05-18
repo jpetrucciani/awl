@@ -67,10 +67,14 @@ vars for the child command, and stops the services afterward.
 Useful development checks:
 
 ```sh
+update_lock
 direnv exec . cargo fmt --check
 direnv exec . cargo clippy --all --benches --tests --examples --all-features -- -D warnings
 direnv exec . cargo test --test local_s3_sqs -- --test-threads=1
 ```
+
+Run `update_lock` after bumping `[package].version` in `Cargo.toml`; it updates
+the local package entry in `Cargo.lock` without rebuilding.
 
 ## Embedded EC2 Type Catalog
 
