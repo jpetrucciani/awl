@@ -1,10 +1,8 @@
 # awl
 
-[![build](https://github.com/jpetrucciani/awl/actions/workflows/build.yml/badge.svg)](https://github.com/jpetrucciani/awl/actions/workflows/build.yml)
-[![release](https://github.com/jpetrucciani/awl/actions/workflows/release.yml/badge.svg)](https://github.com/jpetrucciani/awl/actions/workflows/release.yml)
-[![license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![uses nix](https://img.shields.io/badge/uses-nix-%237EBAE4)](https://nixos.org/)
 ![rust](https://img.shields.io/badge/Rust-1.95%2B-orange.svg)
+[![license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 `awl` is a small/sharp Rust CLI for the AWS operations that come up constantly in day-to-day work. The intent is to be a sharp, minimal set of operational functions, not a full-featured AWS CLI replacement.
 
