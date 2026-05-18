@@ -65,3 +65,36 @@ fn ec2_types_reads_embedded_catalog_without_aws_credentials() {
     assert_eq!(rows[0]["vcpu"], 2);
     assert!(rows[0].get("linux_ondemand_usd_per_hour").is_none());
 }
+
+#[test]
+fn sts_without_region_does_not_probe_imds_for_region() {
+    let home = tempfile::tempdir().expect("temporary home");
+    let config = home.path().join("config");
+    let credentials = home.path().join("credentials");
+    std::fs::write(&config, "").expect("empty config");
+    std::fs::write(&credentials, "").expect("empty credentials");
+
+    let output = Command::cargo_bin("awl")
+        .expect("test binary exists")
+        .env("AWS_ACCESS_KEY_ID", "local")
+        .env("AWS_SECRET_ACCESS_KEY", "local")
+        .env("AWS_CONFIG_FILE", config)
+        .env("AWS_SHARED_CREDENTIALS_FILE", credentials)
+        .env("AWS_EC2_METADATA_DISABLED", "false")
+        .env("AWS_ENDPOINT_URL_STS", "http://127.0.0.1:1")
+        .env_remove("AWS_DEFAULT_REGION")
+        .env_remove("AWS_PROFILE")
+        .env_remove("AWS_REGION")
+        .env_remove("AWS_SESSION_TOKEN")
+        .args(["--max-attempts", "1", "sts", "whoami"])
+        .output()
+        .expect("command runs");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("aws_config::imds::region")
+            && !stderr.contains("failed to load region from IMDS"),
+        "{stderr}"
+    );
+}

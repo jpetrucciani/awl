@@ -14,7 +14,7 @@ struct IdentityRow {
 }
 
 pub async fn run(globals: &Globals, command: &StsCommand) -> Result<()> {
-    let context = AwsContext::new(globals).await?;
+    let context = AwsContext::new_without_imds_region(globals).await?;
     let client = context.sts();
     match &command.command {
         StsCommandSubcommand::Whoami(_) => {

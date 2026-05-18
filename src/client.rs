@@ -1,5 +1,8 @@
 use aws_config::BehaviorVersion;
+use aws_config::default_provider::region::DefaultRegionChain;
+use aws_config::environment::EnvironmentVariableRegionProvider;
 use aws_config::meta::region::RegionProviderChain;
+use aws_config::profile::ProfileFileRegionProvider;
 use aws_config::sts::AssumeRoleProvider;
 use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_types::region::Region;
@@ -15,14 +18,17 @@ pub struct AwsContext {
 
 impl AwsContext {
     pub async fn new(globals: &Globals) -> Result<Self> {
-        let region = globals
-            .region
-            .as_ref()
-            .map(|region| Region::new(region.clone()));
-        let region_provider = RegionProviderChain::first_try(region)
-            .or_default_provider()
-            .or_else(Region::new("us-east-1"));
+        Self::new_with_region_provider(globals, default_region_provider(globals)).await
+    }
 
+    pub async fn new_without_imds_region(globals: &Globals) -> Result<Self> {
+        Self::new_with_region_provider(globals, non_imds_region_provider(globals)).await
+    }
+
+    async fn new_with_region_provider(
+        globals: &Globals,
+        region_provider: RegionProviderChain,
+    ) -> Result<Self> {
         let mut loader = aws_config::defaults(BehaviorVersion::latest()).region(region_provider);
         if let Some(profile) = &globals.profile {
             loader = loader.profile_name(profile);
@@ -131,4 +137,37 @@ impl AwsContext {
             .ok()
             .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok())
     }
+}
+
+fn default_region_provider(globals: &Globals) -> RegionProviderChain {
+    let cli_region = globals
+        .region
+        .as_ref()
+        .map(|region| Region::new(region.clone()));
+    let mut default_region = DefaultRegionChain::builder();
+    if let Some(profile) = &globals.profile {
+        default_region = default_region.profile_name(profile);
+    }
+
+    RegionProviderChain::first_try(cli_region)
+        .or_else(default_region.build())
+        .or_else(Region::new("us-east-1"))
+}
+
+fn non_imds_region_provider(globals: &Globals) -> RegionProviderChain {
+    let cli_region = globals
+        .region
+        .as_ref()
+        .map(|region| Region::new(region.clone()));
+    let profile_region = match &globals.profile {
+        Some(profile) => ProfileFileRegionProvider::builder()
+            .profile_name(profile)
+            .build(),
+        None => ProfileFileRegionProvider::new(),
+    };
+
+    RegionProviderChain::first_try(cli_region)
+        .or_else(EnvironmentVariableRegionProvider::new())
+        .or_else(profile_region)
+        .or_else(Region::new("us-east-1"))
 }
