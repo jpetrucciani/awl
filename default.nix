@@ -308,8 +308,6 @@ EOF
     python3
     rust
     zig
-  ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
-    mingwPthreads
   ] ++ [
 
     # aws
