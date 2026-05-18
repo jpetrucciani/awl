@@ -33,6 +33,16 @@ let
   });
 
   mingw = pkgs.pkgsCross.mingwW64;
+  # This is a Windows target library, but the Linux cross linker needs it in scope.
+  mingwPthreads = mingw.windows.pthreads.overrideAttrs (old: {
+    meta = (old.meta or { }) // {
+      platforms = pkgs.lib.platforms.all;
+    };
+  });
+  windowsCrossEnv = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+    CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "${mingw.stdenv.cc}/bin/x86_64-w64-mingw32-gcc";
+    CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS = "-L native=${mingwPthreads}/lib";
+  };
 
   scripts = with pkgs; {
     fmt = writers.writeBashBin "fmt" ''
@@ -298,21 +308,24 @@ EOF
     python3
     rust
     zig
+  ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+    mingwPthreads
+  ] ++ [
 
     # aws
     gofakes3
     goaws
   ] ++ builtins.attrValues scripts;
 
-  shell = pkgs.mkShellNoCC {
+  shell = pkgs.mkShellNoCC ({
     inherit name packages;
     CC = "${pkgs.stdenv.cc}/bin/cc";
     CXX = "${pkgs.stdenv.cc}/bin/c++";
     AR = "${pkgs.binutils}/bin/ar";
-    CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "${mingw.stdenv.cc}/bin/x86_64-w64-mingw32-gcc";
     RUST_SRC_PATH = "${rust}/lib/rustlib/src/rust/library";
-  };
+  } // windowsCrossEnv);
 in
 (shell.overrideAttrs (_: { inherit name; })) // {
+  bashInteractive = pkgs.bashInteractive;
   inherit scripts;
 }

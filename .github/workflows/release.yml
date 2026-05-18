@@ -47,7 +47,7 @@ jobs:
             target: x86_64-pc-windows-gnu
             asset: awl-windows-amd64.exe
             verify_static: false
-          - runner: macos-14
+          - runner: macos-15
             target: aarch64-apple-darwin
             asset: awl-macos-aarch64
             verify_static: false
@@ -58,10 +58,18 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
       - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            extra-substituters = https://cache.g7c.us
+            extra-trusted-public-keys = cache.g7c.us:dSWpE2B5zK/Fahd7npIQWM4izRnVL+a4LiCAnrjdoFY=
       - name: Build binary
         run: |
+          set -euo pipefail
           version="${TAG_NAME#v}"
-          nix-shell --run "release_artifacts $version ${{ matrix.target }}"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            export NIX_BUILD_SHELL="$(nix-build --no-out-link default.nix -A bashInteractive)/bin/bash"
+          fi
+          nix-shell --fallback --run "release_artifacts $version ${{ matrix.target }}"
           mkdir -p release-out
           cp "dist/v$version/${{ matrix.asset }}" release-out/
       - name: Verify Linux static binary

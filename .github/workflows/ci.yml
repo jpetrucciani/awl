@@ -12,13 +12,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
-      - name: Format
+        with:
+          extra_nix_config: |
+            extra-substituters = https://cache.g7c.us
+            extra-trusted-public-keys = cache.g7c.us:dSWpE2B5zK/Fahd7npIQWM4izRnVL+a4LiCAnrjdoFY=
+      - name: format
         run: nix-shell --run 'cargo fmt --check'
-      - name: Clippy
+      - name: clippy
         run: nix-shell --run 'cargo clippy --all --benches --tests --examples --all-features -- -D warnings'
-      - name: CLI contract tests
+      - name: cli contract tests
         run: nix-shell --run 'cargo test --test cli_contract'
-      - name: Unit tests
+      - name: unit tests
         run: nix-shell --run 'cargo test services::common::tests && cargo test services::kms::tests'
-      - name: Local S3/SQS integration
+      - name: local s3/sqs integration
         run: nix-shell --run 'cargo test --test local_s3_sqs -- --test-threads=1'
