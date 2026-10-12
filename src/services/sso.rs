@@ -1,67 +1,59 @@
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use crate::cli::{Globals, SsoCommand, SsoCommandSubcommand, StubArgs};
+use crate::cli::{Globals, SsoCommand, SsoSubcommand};
 use crate::error::{AwlError, Result};
 use crate::output::{self, Output};
-use crate::services::common;
 
 pub async fn run(globals: &Globals, command: &SsoCommand) -> Result<()> {
     match &command.command {
-        SsoCommandSubcommand::Login(args) => login(globals, args),
-        SsoCommandSubcommand::Logout(args) => logout(globals, args),
-        SsoCommandSubcommand::Ls(_) => ls(globals),
+        SsoSubcommand::Login(args) => {
+            let mut command = aws_command(globals);
+            command.args(["sso", "login"]);
+            if args.no_browser {
+                command.arg("--no-browser");
+            }
+            run_aws(command, "login")?;
+            output::ack(
+                globals,
+                Output::one(
+                    serde_json::json!({ "profile": profile_name(globals), "logged_in": true }),
+                )?,
+            )
+        }
+        SsoSubcommand::Logout => {
+            let mut command = aws_command(globals);
+            command.args(["sso", "logout"]);
+            run_aws(command, "logout")?;
+            output::ack(
+                globals,
+                Output::one(
+                    serde_json::json!({ "profile": profile_name(globals), "logged_out": true }),
+                )?,
+            )
+        }
+        SsoSubcommand::Ls => ls(globals),
     }
 }
 
-fn login(globals: &Globals, args: &StubArgs) -> Result<()> {
-    let profile = profile_name(globals, args);
-    let mut command = aws_command(globals, &profile);
-    command.args(["sso", "login"]);
-    if common::has_flag(&args.args, "--no-browser")
-        || std::env::var("AWL_SSO_NO_BROWSER").is_ok_and(|value| is_true(&value))
-    {
-        command.arg("--no-browser");
-    }
+fn run_aws(mut command: Command, action: &str) -> Result<()> {
     let status = command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .status()?;
+        .status()
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => AwlError::MissingDependency {
+                message: "`awl sso` needs AWS CLI v2 (`aws`) on PATH".to_owned(),
+            },
+            _ => AwlError::Io(error),
+        })?;
     if !status.success() {
         return Err(AwlError::Authentication {
-            message: format!("aws sso login failed with status {status}"),
+            message: format!("aws sso {action} failed with status {status}"),
         });
     }
-    output::emit(
-        globals,
-        Output::one(serde_json::json!({
-            "profile": profile,
-            "logged_in": true,
-        }))?,
-    )
-}
-
-fn logout(globals: &Globals, args: &StubArgs) -> Result<()> {
-    let profile = profile_name(globals, args);
-    let status = aws_command(globals, &profile)
-        .args(["sso", "logout"])
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()?;
-    if !status.success() {
-        return Err(AwlError::Authentication {
-            message: format!("aws sso logout failed with status {status}"),
-        });
-    }
-    output::emit(
-        globals,
-        Output::one(serde_json::json!({
-            "profile": profile,
-            "logged_out": true,
-        }))?,
-    )
+    Ok(())
 }
 
 fn ls(globals: &Globals) -> Result<()> {
@@ -77,32 +69,33 @@ fn ls(globals: &Globals) -> Result<()> {
         }
         let contents = std::fs::read_to_string(entry.path())?;
         let value = serde_json::from_str::<serde_json::Value>(&contents)?;
+        // Client registration files share the directory but are not sessions.
+        let Some(start_url) = value.get("startUrl").and_then(|value| value.as_str()) else {
+            continue;
+        };
         rows.push(serde_json::json!({
-            "cache_file": entry.file_name().to_string_lossy(),
-            "start_url": value.get("startUrl").and_then(|value| value.as_str()),
+            "start_url": start_url,
             "region": value.get("region").and_then(|value| value.as_str()),
             "expires_at": value.get("expiresAt").and_then(|value| value.as_str()),
-            "client_id": value.get("clientId").and_then(|value| value.as_str()),
+            "cache_file": entry.file_name().to_string_lossy(),
         }));
     }
     output::emit(globals, Output::Many(rows))
 }
 
-fn aws_command(globals: &Globals, profile: &str) -> Command {
+fn aws_command(globals: &Globals) -> Command {
     let mut command = Command::new("aws");
-    if !profile.is_empty() {
-        command.args(["--profile", profile]);
-    }
+    command.args(["--profile", &profile_name(globals)]);
     if let Some(region) = &globals.region {
         command.args(["--region", region]);
     }
     command
 }
 
-fn profile_name(globals: &Globals, args: &StubArgs) -> String {
-    common::option_value(&args.args, "--profile")
-        .or_else(|| globals.profile.clone())
-        .or_else(|| std::env::var("AWS_PROFILE").ok())
+fn profile_name(globals: &Globals) -> String {
+    globals
+        .profile
+        .clone()
         .unwrap_or_else(|| "default".to_owned())
 }
 
@@ -113,8 +106,4 @@ fn sso_cache_dir() -> Result<PathBuf> {
             message: "cannot locate home directory for AWS SSO cache".to_owned(),
         })?;
     Ok(PathBuf::from(home).join(".aws").join("sso").join("cache"))
-}
-
-fn is_true(value: &str) -> bool {
-    matches!(value, "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
 }

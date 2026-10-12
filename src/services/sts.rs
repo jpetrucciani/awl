@@ -1,10 +1,9 @@
 use serde::Serialize;
 
-use crate::cli::{Globals, StsCommand, StsCommandSubcommand, StubArgs};
+use crate::cli::{CredentialFormat, Globals, StsAssumeArgs, StsCommand, StsSubcommand};
 use crate::client::AwsContext;
 use crate::error::{AwlError, Result};
 use crate::output::{self, Output};
-use crate::services::common;
 
 #[derive(Debug, Serialize)]
 struct IdentityRow {
@@ -17,12 +16,12 @@ pub async fn run(globals: &Globals, command: &StsCommand) -> Result<()> {
     let context = AwsContext::new_without_imds_region(globals).await?;
     let client = context.sts();
     match &command.command {
-        StsCommandSubcommand::Whoami(_) => {
+        StsSubcommand::Whoami => {
             let response = client
                 .get_caller_identity()
                 .send()
                 .await
-                .map_err(AwlError::aws)?;
+                .map_err(AwlError::sdk)?;
             output::emit(
                 globals,
                 Output::one(IdentityRow {
@@ -32,62 +31,62 @@ pub async fn run(globals: &Globals, command: &StsCommand) -> Result<()> {
                 })?,
             )
         }
-        StsCommandSubcommand::Assume(args) => assume(globals, &client, args).await,
-        StsCommandSubcommand::Decode(args) => {
-            let encoded = common::required(&args.args, 0, "encoded-msg")?;
+        StsSubcommand::Assume(args) => assume(globals, &client, args).await,
+        StsSubcommand::Decode(args) => {
             let response = client
                 .decode_authorization_message()
-                .encoded_message(encoded)
+                .encoded_message(&args.encoded_message)
                 .send()
                 .await
-                .map_err(AwlError::aws)?;
+                .map_err(AwlError::sdk)?;
+            let decoded = response.decoded_message().unwrap_or_default();
+            // The decoded message is a JSON document; show it as one.
+            let decoded = serde_json::from_str::<serde_json::Value>(decoded)
+                .unwrap_or_else(|_| serde_json::Value::String(decoded.to_owned()));
             output::emit(
                 globals,
-                Output::one(serde_json::json!({
-                    "decoded_message": response.decoded_message(),
-                }))?,
+                Output::one(serde_json::json!({ "decoded_message": decoded }))?,
             )
         }
     }
 }
 
-async fn assume(globals: &Globals, client: &aws_sdk_sts::Client, args: &StubArgs) -> Result<()> {
-    let role_arn = common::required(&args.args, 0, "role-arn")?;
-    let duration = common::option_value(&args.args, "--duration")
-        .and_then(|value| value.parse::<i32>().ok())
-        .unwrap_or(3600);
-    let session_name = common::option_value(&args.args, "--session-name")
-        .or_else(|| globals.role_session_name.clone())
-        .unwrap_or_else(|| format!("awl-{}", chrono::Utc::now().timestamp()));
-    let format = common::option_value(&args.args, "--format").unwrap_or_else(|| "env".to_owned());
-    let mut request = client
+async fn assume(
+    globals: &Globals,
+    client: &aws_sdk_sts::Client,
+    args: &StsAssumeArgs,
+) -> Result<()> {
+    let session_name = args
+        .session_name
+        .clone()
+        .unwrap_or_else(|| crate::client::session_name(globals));
+    let response = client
         .assume_role()
-        .role_arn(role_arn)
+        .role_arn(&args.role_arn)
         .role_session_name(session_name)
-        .duration_seconds(duration);
-    if let Some(token) = &globals.mfa_token {
-        request = request.token_code(token);
-    }
-    let response = request.send().await.map_err(AwlError::aws)?;
+        .duration_seconds(args.duration)
+        .set_token_code(globals.mfa_token.clone())
+        .send()
+        .await
+        .map_err(AwlError::sdk)?;
     let Some(credentials) = response.credentials() else {
         return Err(AwlError::Authentication {
             message: "AssumeRole returned no credentials".to_owned(),
         });
     };
 
-    if format == "env" {
-        output::emit(
+    match args.format {
+        CredentialFormat::Env => output::emit(
             globals,
             Output::Plain(format!(
-                "export AWS_ACCESS_KEY_ID={}\nexport AWS_SECRET_ACCESS_KEY={}\nexport AWS_SESSION_TOKEN={}\nexport AWS_EXPIRATION={}",
+                "export AWS_ACCESS_KEY_ID='{}'\nexport AWS_SECRET_ACCESS_KEY='{}'\nexport AWS_SESSION_TOKEN='{}'\nexport AWS_EXPIRATION='{}'",
                 credentials.access_key_id(),
                 credentials.secret_access_key(),
                 credentials.session_token(),
                 credentials.expiration()
             )),
-        )
-    } else {
-        output::emit(
+        ),
+        CredentialFormat::Json => output::emit(
             globals,
             Output::one(serde_json::json!({
                 "access_key_id": credentials.access_key_id(),
@@ -95,6 +94,6 @@ async fn assume(globals: &Globals, client: &aws_sdk_sts::Client, args: &StubArgs
                 "session_token": credentials.session_token(),
                 "expiration": credentials.expiration().to_string(),
             }))?,
-        )
+        ),
     }
 }

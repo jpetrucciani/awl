@@ -2,42 +2,39 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::process::Command;
 
+use aws_sdk_ssm::config::endpoint::{Params, ResolveEndpoint};
 use serde::Deserialize;
 
-use crate::cli::{Ec2Command, Ec2CommandSubcommand, Ec2TypesArgs, Ec2TypesSort, Globals, StubArgs};
+use crate::cli::{
+    Ec2AmiArgs, Ec2Command, Ec2InstancesArgs, Ec2LsArgs, Ec2StopArgs, Ec2Subcommand, Ec2TypesArgs,
+    Ec2TypesSort, Globals,
+};
 use crate::client::AwsContext;
 use crate::error::{AwlError, Result};
 use crate::output::{self, Output};
-use crate::services::common;
 
 const EC2_TYPES_JSON: &str = include_str!("../../data/ec2_instance_types.json");
 
 pub async fn run(globals: &Globals, command: &Ec2Command) -> Result<()> {
-    if let Ec2CommandSubcommand::Types(args) = &command.command {
+    if let Ec2Subcommand::Types(args) = &command.command {
         return types(globals, args);
     }
 
     let context = AwsContext::new(globals).await?;
     let client = context.ec2();
     match &command.command {
-        Ec2CommandSubcommand::Ls(args) => ls(globals, &client, args).await,
-        Ec2CommandSubcommand::Start(args) => start(globals, &client, args).await,
-        Ec2CommandSubcommand::Stop(args) => stop(globals, &client, args).await,
-        Ec2CommandSubcommand::Reboot(args) => reboot(globals, &client, args).await,
-        Ec2CommandSubcommand::Console(args) => console(globals, &client, args).await,
-        Ec2CommandSubcommand::Ssh(args) => ssh(globals, &context.ssm(), args).await,
-        Ec2CommandSubcommand::Ami(args) => ami(globals, &client, args).await,
-        Ec2CommandSubcommand::Types(args) => types(globals, args),
+        Ec2Subcommand::Ls(args) => ls(globals, &client, args).await,
+        Ec2Subcommand::Start(args) => start(globals, &client, args).await,
+        Ec2Subcommand::Stop(args) => stop(globals, &client, args).await,
+        Ec2Subcommand::Reboot(args) => reboot(globals, &client, args).await,
+        Ec2Subcommand::Console(args) => console(globals, &client, &args.instance_id).await,
+        Ec2Subcommand::Ssh(args) => ssh(&context, &args.instance_id, globals).await,
+        Ec2Subcommand::Ami(args) => ami(globals, &client, args).await,
+        Ec2Subcommand::Types(args) => types(globals, args),
     }
 }
 
 fn types(globals: &Globals, args: &Ec2TypesArgs) -> Result<()> {
-    if args.no_price && args.all_prices {
-        return Err(AwlError::Usage {
-            message: "--no-price and --all-prices cannot be used together".to_owned(),
-        });
-    }
-
     let catalog: Ec2TypesCatalog = serde_json::from_str(EC2_TYPES_JSON)?;
     let price_region = price_region(globals, args);
     let mut rows = catalog
@@ -56,131 +53,155 @@ fn types(globals: &Globals, args: &Ec2TypesArgs) -> Result<()> {
     output::emit(globals, Output::Many(rows))
 }
 
-async fn ls(globals: &Globals, client: &aws_sdk_ec2::Client, args: &StubArgs) -> Result<()> {
-    let mut request = client.describe_instances();
-    for id in common::positional(&args.args) {
-        request = request.instance_ids(id);
+async fn ls(globals: &Globals, client: &aws_sdk_ec2::Client, args: &Ec2LsArgs) -> Result<()> {
+    let mut rows = Vec::new();
+    let mut pages = client
+        .describe_instances()
+        .set_instance_ids((!args.instance_ids.is_empty()).then(|| args.instance_ids.clone()))
+        .into_paginator()
+        .send();
+    while let Some(page) = pages.next().await {
+        let page = page.map_err(AwlError::sdk)?;
+        rows.extend(
+            page.reservations()
+                .iter()
+                .flat_map(|reservation| reservation.instances())
+                .map(instance_row),
+        );
     }
-    if common::has_flag(&args.args, "--dry-run") || common::has_flag(&args.args, "--dryrun") {
-        request = request.dry_run(true);
-    }
-    let response = request.send().await.map_err(AwlError::aws)?;
-    let rows = response
-        .reservations()
-        .iter()
-        .flat_map(|reservation| reservation.instances())
-        .map(instance_row)
-        .collect::<Vec<_>>();
     output::emit(globals, Output::Many(rows))
 }
 
-async fn start(globals: &Globals, client: &aws_sdk_ec2::Client, args: &StubArgs) -> Result<()> {
-    let ids = required_instance_ids(args)?;
-    let mut request = client.start_instances();
-    for id in &ids {
-        request = request.instance_ids(id);
-    }
-    if dry_run(args) {
-        request = request.dry_run(true);
-    }
-    let response = request.send().await.map_err(AwlError::aws)?;
-    output::emit(
+async fn start(
+    globals: &Globals,
+    client: &aws_sdk_ec2::Client,
+    args: &Ec2InstancesArgs,
+) -> Result<()> {
+    let response = client
+        .start_instances()
+        .set_instance_ids(Some(args.instance_ids.clone()))
+        .dry_run(args.dry_run.dry_run)
+        .send()
+        .await
+        .map_err(AwlError::sdk)?;
+    output::ack(
         globals,
         Output::Many(state_changes(response.starting_instances())),
     )
 }
 
-async fn stop(globals: &Globals, client: &aws_sdk_ec2::Client, args: &StubArgs) -> Result<()> {
-    let ids = required_instance_ids(args)?;
-    let mut request = client
+async fn stop(globals: &Globals, client: &aws_sdk_ec2::Client, args: &Ec2StopArgs) -> Result<()> {
+    let response = client
         .stop_instances()
-        .force(common::has_flag(&args.args, "--force"));
-    for id in &ids {
-        request = request.instance_ids(id);
-    }
-    if dry_run(args) {
-        request = request.dry_run(true);
-    }
-    let response = request.send().await.map_err(AwlError::aws)?;
-    output::emit(
+        .set_instance_ids(Some(args.instances.instance_ids.clone()))
+        .force(args.force)
+        .dry_run(args.instances.dry_run.dry_run)
+        .send()
+        .await
+        .map_err(AwlError::sdk)?;
+    output::ack(
         globals,
         Output::Many(state_changes(response.stopping_instances())),
     )
 }
 
-async fn reboot(globals: &Globals, client: &aws_sdk_ec2::Client, args: &StubArgs) -> Result<()> {
-    let ids = required_instance_ids(args)?;
-    let mut request = client.reboot_instances();
-    for id in &ids {
-        request = request.instance_ids(id);
-    }
-    if dry_run(args) {
-        request = request.dry_run(true);
-    }
-    request.send().await.map_err(AwlError::aws)?;
-    output::emit(
+async fn reboot(
+    globals: &Globals,
+    client: &aws_sdk_ec2::Client,
+    args: &Ec2InstancesArgs,
+) -> Result<()> {
+    client
+        .reboot_instances()
+        .set_instance_ids(Some(args.instance_ids.clone()))
+        .dry_run(args.dry_run.dry_run)
+        .send()
+        .await
+        .map_err(AwlError::sdk)?;
+    output::ack(
         globals,
         Output::Many(
-            ids.into_iter()
+            args.instance_ids
+                .iter()
                 .map(|id| serde_json::json!({ "instance_id": id, "action": "reboot" }))
                 .collect(),
         ),
     )
 }
 
-async fn console(globals: &Globals, client: &aws_sdk_ec2::Client, args: &StubArgs) -> Result<()> {
-    let instance_id = common::required(&common::positional(&args.args), 0, "instance-id")?;
+async fn console(globals: &Globals, client: &aws_sdk_ec2::Client, instance_id: &str) -> Result<()> {
     let response = client
         .get_console_output()
         .instance_id(instance_id)
         .latest(true)
         .send()
         .await
-        .map_err(AwlError::aws)?;
+        .map_err(AwlError::sdk)?;
+    // The API returns base64; decode it so the console log is readable.
+    let output = response.output().map(|encoded| {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_else(|_| encoded.to_owned())
+    });
     output::emit(
         globals,
         Output::one(serde_json::json!({
             "instance_id": response.instance_id(),
             "timestamp": response.timestamp().map(ToString::to_string),
-            "output": response.output(),
+            "output": output,
         }))?,
     )
 }
 
-async fn ssh(globals: &Globals, client: &aws_sdk_ssm::Client, args: &StubArgs) -> Result<()> {
-    let instance_id = common::required(&common::positional(&args.args), 0, "instance-id")?;
-    let response = client
+async fn ssh(context: &AwsContext, instance_id: &str, globals: &Globals) -> Result<()> {
+    let region = context.region().unwrap_or("us-east-1").to_owned();
+    // The plugin needs the same SSM endpoint the session was started against.
+    let endpoint = match context.endpoint_url() {
+        Some(endpoint) => endpoint.to_owned(),
+        None => {
+            let params = Params::builder()
+                .region(region.clone())
+                .build()
+                .map_err(AwlError::aws)?;
+            aws_sdk_ssm::config::endpoint::DefaultResolver::new()
+                .resolve_endpoint(&params)
+                .await
+                .map_err(AwlError::aws)?
+                .url()
+                .to_owned()
+        }
+    };
+    let response = context
+        .ssm()
         .start_session()
-        .target(instance_id.clone())
+        .target(instance_id)
         .send()
         .await
-        .map_err(AwlError::aws)?;
+        .map_err(AwlError::sdk)?;
     let session = serde_json::json!({
         "SessionId": response.session_id(),
         "TokenValue": response.token_value(),
         "StreamUrl": response.stream_url(),
     })
     .to_string();
-    let region = globals
-        .region
-        .clone()
-        .or_else(|| std::env::var("AWS_REGION").ok())
-        .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
-        .unwrap_or_else(|| "us-east-1".to_owned());
-    let profile = globals.profile.clone().unwrap_or_default();
     let parameters = serde_json::json!({ "Target": instance_id }).to_string();
-    let endpoint = format!("https://ssm.{region}.amazonaws.com");
     let status = Command::new("session-manager-plugin")
         .args([
             session,
             region,
             "StartSession".to_owned(),
-            profile,
+            globals.profile.clone().unwrap_or_default(),
             parameters,
             endpoint,
         ])
         .status()
-        .map_err(AwlError::Io)?;
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => AwlError::MissingDependency {
+                message: "`awl ec2 ssh` needs session-manager-plugin on PATH".to_owned(),
+            },
+            _ => AwlError::Io(error),
+        })?;
     if status.success() {
         Ok(())
     } else {
@@ -190,19 +211,22 @@ async fn ssh(globals: &Globals, client: &aws_sdk_ssm::Client, args: &StubArgs) -
     }
 }
 
-async fn ami(globals: &Globals, client: &aws_sdk_ec2::Client, args: &StubArgs) -> Result<()> {
-    let mut request = client.describe_images();
-    for id in common::positional(&args.args) {
-        request = request.image_ids(id);
-    }
-    if dry_run(args) {
-        request = request.dry_run(true);
-    }
-    let response = request.send().await.map_err(AwlError::aws)?;
-    let rows = response
-        .images()
-        .iter()
-        .map(|image| {
+async fn ami(globals: &Globals, client: &aws_sdk_ec2::Client, args: &Ec2AmiArgs) -> Result<()> {
+    // Without IDs or owners DescribeImages walks every public AMI.
+    let owners = if args.owner.is_empty() && args.image_ids.is_empty() {
+        vec!["self".to_owned()]
+    } else {
+        args.owner.clone()
+    };
+    let mut rows = Vec::new();
+    let mut pages = client
+        .describe_images()
+        .set_image_ids((!args.image_ids.is_empty()).then(|| args.image_ids.clone()))
+        .set_owners((!owners.is_empty()).then_some(owners))
+        .into_paginator()
+        .send();
+    while let Some(page) = pages.next().await {
+        rows.extend(page.map_err(AwlError::sdk)?.images().iter().map(|image| {
             serde_json::json!({
                 "image_id": image.image_id(),
                 "name": image.name(),
@@ -211,8 +235,8 @@ async fn ami(globals: &Globals, client: &aws_sdk_ec2::Client, args: &StubArgs) -
                 "owner_id": image.owner_id(),
                 "creation_date": image.creation_date(),
             })
-        })
-        .collect::<Vec<_>>();
+        }));
+    }
     output::emit(globals, Output::Many(rows))
 }
 
@@ -251,21 +275,6 @@ fn state_changes(changes: &[aws_sdk_ec2::types::InstanceStateChange]) -> Vec<ser
             })
         })
         .collect()
-}
-
-fn required_instance_ids(args: &StubArgs) -> Result<Vec<String>> {
-    let ids = common::positional(&args.args);
-    if ids.is_empty() {
-        Err(AwlError::Usage {
-            message: "missing required argument <instance-id>".to_owned(),
-        })
-    } else {
-        Ok(ids)
-    }
-}
-
-fn dry_run(args: &StubArgs) -> bool {
-    common::has_flag(&args.args, "--dry-run") || common::has_flag(&args.args, "--dryrun")
 }
 
 fn tag_value<'a>(tags: &'a [aws_sdk_ec2::types::Tag], key: &str) -> Option<&'a str> {

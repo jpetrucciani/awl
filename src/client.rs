@@ -3,16 +3,16 @@ use aws_config::default_provider::region::DefaultRegionChain;
 use aws_config::environment::EnvironmentVariableRegionProvider;
 use aws_config::meta::region::RegionProviderChain;
 use aws_config::profile::ProfileFileRegionProvider;
+use aws_config::retry::RetryConfig;
 use aws_config::sts::AssumeRoleProvider;
 use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_types::region::Region;
 
-use crate::cli::Globals;
-use crate::error::Result;
+use crate::cli::{Globals, RetryMode};
+use crate::error::{AwlError, Result};
 
 #[derive(Clone)]
 pub struct AwsContext {
-    globals: Globals,
     shared: aws_config::SdkConfig,
 }
 
@@ -33,26 +33,32 @@ impl AwsContext {
         if let Some(profile) = &globals.profile {
             loader = loader.profile_name(profile);
         }
-        if let Some(max_attempts) = globals.max_attempts {
-            loader = loader.retry_config(
-                aws_config::retry::RetryConfig::standard().with_max_attempts(max_attempts),
-            );
+        // Only the CLI flag is applied here; the SDK already resolves
+        // AWS_ENDPOINT_URL_<SERVICE> before AWS_ENDPOINT_URL.
+        if let Some(endpoint) = &globals.endpoint_url {
+            loader = loader.endpoint_url(endpoint);
+        }
+        if globals.retry_mode.is_some() || globals.max_attempts.is_some() {
+            let mut retry = match globals.retry_mode {
+                Some(RetryMode::Adaptive) => RetryConfig::adaptive(),
+                Some(RetryMode::Standard | RetryMode::Legacy) | None => RetryConfig::standard(),
+            };
+            if let Some(max_attempts) = globals.max_attempts {
+                retry = retry.with_max_attempts(max_attempts);
+            }
+            loader = loader.retry_config(retry);
         }
 
         let mut shared = loader.load().await;
         if let Some(role_arn) = &globals.role_arn {
             if globals.mfa_token.is_some() {
-                return Err(crate::error::AwlError::Usage {
+                return Err(AwlError::Usage {
                     message: "global --mfa-token is only supported by `awl sts assume` for now"
                         .to_owned(),
                 });
             }
-            let session_name = globals
-                .role_session_name
-                .clone()
-                .unwrap_or_else(|| format!("awl-{}", chrono::Utc::now().timestamp()));
             let provider = AssumeRoleProvider::builder(role_arn)
-                .session_name(session_name)
+                .session_name(session_name(globals))
                 .configure(&shared)
                 .build()
                 .await;
@@ -62,29 +68,26 @@ impl AwsContext {
                 .build();
         }
 
-        Ok(Self {
-            globals: globals.clone(),
-            shared,
-        })
+        Ok(Self { shared })
+    }
+
+    pub fn region(&self) -> Option<&str> {
+        self.shared.region().map(Region::as_ref)
+    }
+
+    pub fn endpoint_url(&self) -> Option<&str> {
+        self.shared.endpoint_url()
     }
 
     pub fn s3(&self, path_style: bool) -> aws_sdk_s3::Client {
-        let mut builder = aws_sdk_s3::config::Builder::from(&self.shared);
-        if let Some(endpoint) = self.endpoint_for("S3") {
-            builder = builder.endpoint_url(endpoint);
-        }
-        if path_style {
-            builder = builder.force_path_style(true);
-        }
-        aws_sdk_s3::Client::from_conf(builder.build())
+        let config = aws_sdk_s3::config::Builder::from(&self.shared)
+            .force_path_style(path_style)
+            .build();
+        aws_sdk_s3::Client::from_conf(config)
     }
 
     pub fn sqs(&self) -> aws_sdk_sqs::Client {
-        let mut builder = aws_sdk_sqs::config::Builder::from(&self.shared);
-        if let Some(endpoint) = self.endpoint_for("SQS") {
-            builder = builder.endpoint_url(endpoint);
-        }
-        aws_sdk_sqs::Client::from_conf(builder.build())
+        aws_sdk_sqs::Client::new(&self.shared)
     }
 
     pub fn sts(&self) -> aws_sdk_sts::Client {
@@ -126,17 +129,13 @@ impl AwsContext {
     pub fn kms(&self) -> aws_sdk_kms::Client {
         aws_sdk_kms::Client::new(&self.shared)
     }
+}
 
-    fn endpoint_for(&self, service: &str) -> Option<String> {
-        if let Some(endpoint) = &self.globals.endpoint_url {
-            return Some(endpoint.clone());
-        }
-
-        let service_key = format!("AWS_ENDPOINT_URL_{service}");
-        std::env::var(service_key)
-            .ok()
-            .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok())
-    }
+pub fn session_name(globals: &Globals) -> String {
+    globals
+        .role_session_name
+        .clone()
+        .unwrap_or_else(|| format!("awl-{}", chrono::Utc::now().timestamp()))
 }
 
 fn default_region_provider(globals: &Globals) -> RegionProviderChain {

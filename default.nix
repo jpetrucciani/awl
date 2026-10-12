@@ -21,16 +21,32 @@ let
     "x86_64-pc-windows-gnu"
   ];
 
-  rust = pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.default.override {
-    extensions = [ "rust-src" "rustc-dev" "rust-analyzer" ];
-    targets = [
-      muslTarget
-      "aarch64-unknown-linux-musl"
-      "x86_64-pc-windows-gnu"
-    ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
-      "aarch64-apple-darwin"
-    ];
+  rustTargets = releaseTargets ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+    "aarch64-apple-darwin"
+  ];
+  # Lean toolchain for nix builds; the dev shell adds editor tooling on top.
+  rustBuild = pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.default.override {
+    targets = rustTargets;
   });
+  rust = pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.default.override {
+    extensions = [ "rust-src" "rust-analyzer" ];
+    targets = rustTargets;
+  });
+
+  crane = import
+    (fetchTarball {
+      name = "crane-v0.24.0";
+      url = "https://github.com/ipetkov/crane/archive/refs/tags/v0.24.0.tar.gz";
+      sha256 = "06y3dvs9ms4c70r2ia50k77650yrihc09jibqbqrzly23dn42s4m";
+    })
+    { inherit pkgs; };
+  craneLib = crane.overrideToolchain (_: rustBuild);
+
+  srcFiles = pkgs.lib.fileset.unions [
+    (craneLib.fileset.commonCargoSources ./.)
+    ./data
+  ];
+  src = pkgs.lib.fileset.toSource { root = ./.; fileset = srcFiles; };
 
   mingw = pkgs.pkgsCross.mingwW64;
   # This is a Windows target library, but the Linux cross linker needs it in scope.
@@ -44,6 +60,81 @@ let
     CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS = "-L native=${mingwPthreads}/lib";
   };
 
+  # Release version bumps must not invalidate dependency builds, so the deps
+  # derivation sees a fixed version for awl itself in its name and Cargo.lock.
+  awlVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
+  depsCargoLock = builtins.toFile "Cargo.lock" (builtins.replaceStrings
+    [ "name = \"awl-cli\"\nversion = \"${awlVersion}\"" ]
+    [ "name = \"awl-cli\"\nversion = \"0.0.0\"" ]
+    (builtins.readFile ./Cargo.lock));
+  depsDummySrc = craneLib.mkDummySrc {
+    src = pkgs.lib.fileset.toSource {
+      root = ./.;
+      fileset = pkgs.lib.fileset.difference srcFiles ./Cargo.lock;
+    };
+    cargoLock = depsCargoLock;
+    cleanCargoTomlFilter = path:
+      path != [ "package" "version" ] && craneLib.filters.cargoTomlDefault path;
+  };
+  buildDeps = attrs: craneLib.buildDepsOnly (attrs // {
+    version = "0";
+    dummySrc = depsDummySrc;
+  });
+
+  # Cross builds go through cargo-zigbuild, which also cross-compiles the C in
+  # aws-lc-sys. Dependencies build once per target in their own derivation, so
+  # source-only changes reuse them from the store or a binary cache.
+  crossPackage = target:
+    let
+      common = {
+        inherit src;
+        pname = name;
+        strictDeps = true;
+        doCheck = false;
+        nativeBuildInputs = [ pkgs.cargo-zigbuild pkgs.zig ];
+        cargoExtraArgs = "--locked --target ${target}";
+        cargoCheckCommand = "true";
+        cargoBuildCommand = "cargo zigbuild --profile release";
+        preBuild = ''
+          export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-global"
+          export ZIG_LOCAL_CACHE_DIR="$TMPDIR/zig-local"
+          export XDG_CACHE_HOME="$TMPDIR/cache"
+        '';
+        # Host strip/patchelf must not touch foreign or static binaries.
+        dontStrip = true;
+        dontPatchELF = true;
+      } // pkgs.lib.optionalAttrs (target == "x86_64-pc-windows-gnu") windowsCrossEnv;
+    in
+    craneLib.buildPackage (common // {
+      cargoArtifacts = buildDeps common;
+    });
+
+  packages = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux
+    (pkgs.lib.genAttrs releaseTargets crossPackage);
+
+  # CI checks: one shared dev-profile dependency build for clippy and tests.
+  checkCommon = {
+    inherit src;
+    pname = name;
+    strictDeps = true;
+    CARGO_PROFILE = "dev";
+  };
+  checkArtifacts = buildDeps checkCommon;
+  checks = {
+    fmt = craneLib.cargoFmt { inherit src; pname = name; };
+    clippy = craneLib.cargoClippy (checkCommon // {
+      cargoArtifacts = checkArtifacts;
+      cargoClippyExtraArgs = "--all --benches --tests --examples --all-features -- -D warnings";
+    });
+    test = craneLib.cargoTest (checkCommon // {
+      cargoArtifacts = checkArtifacts;
+      nativeCheckInputs = [ pkgs.gofakes3 pkgs.goaws ];
+      # The sandbox has no system CA store, which debug-build rustls asserts on.
+      SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+      cargoTestExtraArgs = "-- --test-threads=1";
+    });
+  };
+
   scripts = with pkgs; {
     fmt = writers.writeBashBin "fmt" ''
       set -euo pipefail
@@ -53,16 +144,6 @@ let
     clippy_all = writers.writeBashBin "clippy_all" ''
       set -euo pipefail
       cargo clippy --all --benches --tests --examples --all-features -- -D warnings
-    '';
-
-    test_all_features = writers.writeBashBin "test_all_features" ''
-      set -euo pipefail
-      cargo test --all-features
-    '';
-
-    test_no_default_features = writers.writeBashBin "test_no_default_features" ''
-      set -euo pipefail
-      cargo test --no-default-features
     '';
 
     refresh_ec2_types = writers.writeBashBin "refresh_ec2_types" ''
@@ -79,16 +160,12 @@ let
       set -euo pipefail
       cargo fmt --check
       cargo clippy --all --benches --tests --examples --all-features -- -D warnings
-      cargo test --all-features
-      cargo test --no-default-features
+      cargo test -- --test-threads=1
     '';
 
     build_static = writers.writeBashBin "build_static" ''
       set -euo pipefail
-      export ZIG_LOCAL_CACHE_DIR="''${ZIG_LOCAL_CACHE_DIR:-$PWD/.zig-cache/local}"
-      export ZIG_GLOBAL_CACHE_DIR="''${ZIG_GLOBAL_CACHE_DIR:-$PWD/.zig-cache/global}"
-      mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
-      cargo zigbuild --release --locked --all-features --target ${muslTarget}
+      nix-build --no-out-link -A packages.${muslTarget} "$PWD/default.nix"
     '';
 
     release_artifacts = writers.writeBashBin "release_artifacts" ''
@@ -115,9 +192,6 @@ let
       }
 
       version="''${1:-}"
-      export ZIG_LOCAL_CACHE_DIR="''${ZIG_LOCAL_CACHE_DIR:-$PWD/.zig-cache/local}"
-      export ZIG_GLOBAL_CACHE_DIR="''${ZIG_GLOBAL_CACHE_DIR:-$PWD/.zig-cache/global}"
-      mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
 
       if test -z "$version"; then
         version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
@@ -139,14 +213,14 @@ let
       for target in $targets; do
         case "$target" in
           *linux-musl|*windows-gnu)
-            cargo zigbuild --release --locked --all-features --target "$target"
+            # crane package: dependency builds are cached as their own derivation
+            binary="$(nix-build --no-out-link -A "packages.$target" "$PWD/default.nix")/bin/awl"
             ;;
           *)
-            cargo build --release --locked --all-features --target "$target"
+            cargo build --release --locked --target "$target"
+            binary="target/$target/release/awl"
             ;;
         esac
-
-        binary="target/$target/release/awl"
         if test "$target" = "x86_64-pc-windows-gnu"; then
           binary="$binary.exe"
         fi
@@ -174,7 +248,8 @@ let
       state_dir="''${AWL_LOCAL_STATE_DIR:-.awl-local}"
       s3_host="''${AWL_LOCAL_S3_HOST:-127.0.0.1}"
       s3_port="''${AWL_LOCAL_S3_PORT:-9000}"
-      sqs_host="''${AWL_LOCAL_SQS_HOST:-127.0.0.1}"
+      # goaws always listens on 4100.
+      sqs_host="127.0.0.1"
       sqs_port="4100"
 
       mkdir -p "$state_dir/logs" "$state_dir/gofakes3"
@@ -220,6 +295,8 @@ export AWS_REGION=us-east-1
 export AWS_ENDPOINT_URL_S3=http://$s3_host:$s3_port
 export AWS_ENDPOINT_URL_SQS=http://$sqs_host:$sqs_port
 export AWL_S3_PATH_STYLE=true
+export AWL_SQS_QUERY_PROTOCOL=true
+export AWS_REQUEST_CHECKSUM_CALCULATION=when_required
 EOF
       }
 
@@ -234,6 +311,19 @@ EOF
         start_one goaws \
           goaws \
             -loglevel error
+        wait_for_port "$s3_host" "$s3_port"
+        wait_for_port "$sqs_host" "$sqs_port"
+      }
+
+      wait_for_port() {
+        for _ in $(seq 1 50); do
+          if (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null; then
+            return
+          fi
+          sleep 0.1
+        done
+        printf 'timed out waiting for %s:%s\n' "$1" "$2" >&2
+        exit 1
       }
 
       stop_all() {
@@ -276,12 +366,7 @@ EOF
           fi
           start_all
           trap stop_all EXIT
-          export AWS_ACCESS_KEY_ID=local
-          export AWS_SECRET_ACCESS_KEY=local
-          export AWS_REGION=us-east-1
-          export AWS_ENDPOINT_URL_S3="http://$s3_host:$s3_port"
-          export AWS_ENDPOINT_URL_SQS="http://$sqs_host:$sqs_port"
-          export AWL_S3_PATH_STYLE=true
+          eval "$(print_env)"
           "$@"
           ;;
         *)
@@ -299,7 +384,7 @@ EOF
     '';
   };
 
-  packages = with pkgs; [
+  shellPackages = with pkgs; [
     cargo-zigbuild
     file
     gh
@@ -316,7 +401,8 @@ EOF
   ] ++ builtins.attrValues scripts;
 
   shell = pkgs.mkShellNoCC ({
-    inherit name packages;
+    inherit name;
+    packages = shellPackages;
     CC = "${pkgs.stdenv.cc}/bin/cc";
     CXX = "${pkgs.stdenv.cc}/bin/c++";
     AR = "${pkgs.binutils}/bin/ar";
@@ -325,5 +411,5 @@ EOF
 in
 (shell.overrideAttrs (_: { inherit name; })) // {
   bashInteractive = pkgs.bashInteractive;
-  inherit scripts;
+  inherit scripts packages checks;
 }

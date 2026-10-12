@@ -4,6 +4,7 @@ use std::process::ExitCode;
 async fn main() -> ExitCode {
     match awl_cli::run().await {
         Ok(()) => ExitCode::SUCCESS,
+        Err(error) if error.is_broken_pipe() => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");
             ExitCode::from(error.exit_code())

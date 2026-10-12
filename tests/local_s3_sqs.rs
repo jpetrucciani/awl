@@ -23,14 +23,11 @@ impl Drop for ChildGuard {
 
 #[tokio::test]
 async fn local_s3_and_sqs_round_trip() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(gofakes3) = find_bin("GOFAKES3_BIN", "gofakes3") else {
-        eprintln!("skipping local S3/SQS test: gofakes3 not found");
-        return Ok(());
-    };
-    let Some(goaws) = find_bin("GOAWS_BIN", "goaws") else {
-        eprintln!("skipping local S3/SQS test: goaws not found");
-        return Ok(());
-    };
+    // Fail rather than skip: a missing fake should not look like a passing test.
+    let gofakes3 = find_bin("GOFAKES3_BIN", "gofakes3")
+        .ok_or("gofakes3 not found; run inside the nix shell or set GOFAKES3_BIN")?;
+    let goaws = find_bin("GOAWS_BIN", "goaws")
+        .ok_or("goaws not found; run inside the nix shell or set GOAWS_BIN")?;
 
     let temp = TempDir::new()?;
     let s3_addr = SocketAddr::from(([127, 0, 0, 1], 19000));
@@ -89,6 +86,70 @@ async fn local_s3_and_sqs_round_trip() -> Result<(), Box<dyn std::error::Error>>
         .assert()
         .success();
     assert_eq!(std::fs::read_to_string(&output)?, "hello from awl\n");
+
+    // sync --delete treats s3://bucket/logs as a directory and leaves the
+    // sibling logs-archive/ prefix alone.
+    for key in ["logs/old.txt", "logs-archive/keep.txt"] {
+        awl()
+            .envs(local_env(&s3_endpoint, &sqs_endpoint))
+            .args([
+                "-q",
+                "s3",
+                "put",
+                input.to_str().ok_or("input path is not utf-8")?,
+                &format!("s3://awl-test/{key}"),
+            ])
+            .assert()
+            .success();
+    }
+    let sync_src = temp.path().join("sync-src");
+    std::fs::create_dir_all(&sync_src)?;
+    std::fs::write(sync_src.join("new.txt"), "new\n")?;
+    let sync_src = sync_src.to_str().ok_or("sync path is not utf-8")?;
+    awl()
+        .envs(local_env(&s3_endpoint, &sqs_endpoint))
+        .args([
+            "--output",
+            "jsonl",
+            "s3",
+            "sync",
+            sync_src,
+            "s3://awl-test/logs",
+            "--delete",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"action\":\"upload\""))
+        .stdout(predicate::str::contains("logs/old.txt"));
+    awl()
+        .envs(local_env(&s3_endpoint, &sqs_endpoint))
+        .args([
+            "--output",
+            "jsonl",
+            "s3",
+            "ls",
+            "s3://awl-test/",
+            "--recursive",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("logs-archive/keep.txt"))
+        .stdout(predicate::str::contains("logs/new.txt"))
+        .stdout(predicate::str::contains("logs/old.txt").not());
+    // Nothing changed, so a second sync transfers nothing.
+    awl()
+        .envs(local_env(&s3_endpoint, &sqs_endpoint))
+        .args([
+            "--output",
+            "jsonl",
+            "s3",
+            "sync",
+            sync_src,
+            "s3://awl-test/logs",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
 
     create_queue(&sqs_endpoint, "awl-test").await?;
 
@@ -181,6 +242,12 @@ fn local_env(s3_endpoint: &str, sqs_endpoint: &str) -> Vec<(&'static str, OsStri
         ("AWS_ENDPOINT_URL_S3", OsString::from(s3_endpoint)),
         ("AWS_ENDPOINT_URL_SQS", OsString::from(sqs_endpoint)),
         ("AWL_S3_PATH_STYLE", OsString::from("true")),
+        ("AWL_SQS_QUERY_PROTOCOL", OsString::from("true")),
+        // gofakes3 cannot parse aws-chunked uploads with trailing checksums.
+        (
+            "AWS_REQUEST_CHECKSUM_CALCULATION",
+            OsString::from("when_required"),
+        ),
     ]
 }
 

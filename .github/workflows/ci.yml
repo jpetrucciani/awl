@@ -16,13 +16,5 @@ jobs:
           extra_nix_config: |
             extra-substituters = https://cache.g7c.us
             extra-trusted-public-keys = cache.g7c.us:dSWpE2B5zK/Fahd7npIQWM4izRnVL+a4LiCAnrjdoFY=
-      - name: format
-        run: nix-shell --run 'cargo fmt --check'
-      - name: clippy
-        run: nix-shell --run 'cargo clippy --all --benches --tests --examples --all-features -- -D warnings'
-      - name: cli contract tests
-        run: nix-shell --run 'cargo test --test cli_contract'
-      - name: unit tests
-        run: nix-shell --run 'cargo test services::common::tests && cargo test services::kms::tests'
-      - name: local s3/sqs integration
-        run: nix-shell --run 'cargo test --test local_s3_sqs -- --test-threads=1'
+      - name: checks (fmt, clippy, unit + integration tests)
+        run: nix-build --no-out-link -A checks
