@@ -67,8 +67,13 @@ fn ls(globals: &Globals) -> Result<()> {
         if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
         }
-        let contents = std::fs::read_to_string(entry.path())?;
-        let value = serde_json::from_str::<serde_json::Value>(&contents)?;
+        // Skip unreadable or half-written files so one bad entry hides nothing else.
+        let Some(value) = std::fs::read_to_string(entry.path())
+            .ok()
+            .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+        else {
+            continue;
+        };
         // Client registration files share the directory but are not sessions.
         let Some(start_url) = value.get("startUrl").and_then(|value| value.as_str()) else {
             continue;

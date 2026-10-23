@@ -65,8 +65,11 @@ async fn decrypt(
     client: &aws_sdk_kms::Client,
     args: &KmsDecryptArgs,
 ) -> Result<()> {
-    let input = common::stdin_or_string(&args.ciphertext)?;
-    let ciphertext = decode_bytes(input.trim(), args.input_encoding)?;
+    // Raw ciphertext is binary, so only the text encodings are read as strings.
+    let ciphertext = match args.input_encoding {
+        BlobEncoding::Raw => common::stdin_or_bytes(&args.ciphertext)?,
+        encoding => decode_bytes(common::stdin_or_string(&args.ciphertext)?.trim(), encoding)?,
+    };
     let response = client
         .decrypt()
         .ciphertext_blob(aws_sdk_kms::primitives::Blob::new(ciphertext))

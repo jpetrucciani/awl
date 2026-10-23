@@ -431,6 +431,7 @@ pub struct StsCommand {
 #[derive(Debug, Subcommand)]
 pub enum StsSubcommand {
     /// Show the caller identity
+    #[command(visible_alias = "get-caller-identity")]
     Whoami,
     /// Assume a role and print credentials
     #[command(

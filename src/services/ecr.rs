@@ -170,9 +170,11 @@ async fn login(
         return output::emit(globals, Output::Plain(password.to_owned()));
     }
 
+    // docker prints "Login Succeeded" on stdout; keep stdout for awl's own output.
     let mut child = Command::new("docker")
         .args(["login", "--username", "AWS", "--password-stdin", endpoint])
         .stdin(Stdio::piped())
+        .stdout(std::io::stderr())
         .spawn()
         .map_err(|error| match error.kind() {
             std::io::ErrorKind::NotFound => AwlError::MissingDependency {

@@ -5,6 +5,7 @@ use std::time::UNIX_EPOCH;
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::{ByteStream, Length};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier};
+use aws_types::region::Region;
 use futures::StreamExt;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Serialize;
@@ -113,13 +114,47 @@ pub async fn run(globals: &Globals, command: &S3Command) -> Result<()> {
     }
 }
 
-async fn client(globals: &Globals, path_style: bool) -> Result<aws_sdk_s3::Client> {
-    Ok(AwsContext::new(globals).await?.s3(path_style))
+/// A client signed for `bucket`'s own region. S3 answers requests sent to the
+/// wrong region with a PermanentRedirect instead of following it, so look the
+/// region up first the way the AWS CLI does.
+async fn bucket_client(context: &AwsContext, path_style: bool, bucket: &str) -> aws_sdk_s3::Client {
+    let client = context.s3(path_style, None);
+    // Custom endpoints (minio, localstack) have no regional redirects to follow.
+    if context.endpoint_url().is_some() {
+        return client;
+    }
+    // HeadBucket reports the region on success and on 301/403 errors. Anything
+    // else falls through so the real request surfaces the real error.
+    let region = match client.head_bucket().bucket(bucket).send().await {
+        Ok(output) => output.bucket_region().map(str::to_owned),
+        Err(error) => error
+            .raw_response()
+            .and_then(|response| response.headers().get("x-amz-bucket-region"))
+            .map(str::to_owned),
+    };
+    match region {
+        Some(region) if context.region() != Some(region.as_str()) => {
+            context.s3(path_style, Some(Region::new(region)))
+        }
+        _ => client,
+    }
+}
+
+async fn location_client(
+    context: &AwsContext,
+    path_style: bool,
+    location: &Location,
+) -> aws_sdk_s3::Client {
+    match location {
+        Location::S3(uri) => bucket_client(context, path_style, &uri.bucket).await,
+        Location::Local(_) => context.s3(path_style, None),
+    }
 }
 
 async fn ls(globals: &Globals, args: &S3LsArgs) -> Result<()> {
-    let client = client(globals, args.common.path_style).await?;
+    let context = AwsContext::new(globals).await?;
     let Some(uri) = &args.uri else {
+        let client = context.s3(args.common.path_style, None);
         let mut rows = Vec::new();
         let mut pages = client.list_buckets().into_paginator().send();
         while let Some(page) = pages.next().await {
@@ -134,6 +169,7 @@ async fn ls(globals: &Globals, args: &S3LsArgs) -> Result<()> {
     };
 
     let uri = parse_s3_uri(uri)?;
+    let client = bucket_client(&context, args.common.path_style, &uri.bucket).await;
     let mut request = client
         .list_objects_v2()
         .bucket(&uri.bucket)
@@ -167,8 +203,9 @@ async fn ls(globals: &Globals, args: &S3LsArgs) -> Result<()> {
 }
 
 async fn get(globals: &Globals, args: &S3GetArgs) -> Result<()> {
-    let client = client(globals, args.common.path_style).await?;
     let uri = parse_s3_uri(&args.uri)?;
+    let context = AwsContext::new(globals).await?;
+    let client = bucket_client(&context, args.common.path_style, &uri.bucket).await;
 
     if args
         .dest
@@ -214,8 +251,9 @@ async fn get(globals: &Globals, args: &S3GetArgs) -> Result<()> {
 }
 
 async fn put(globals: &Globals, args: &S3PutArgs) -> Result<()> {
-    let client = client(globals, args.common.path_style).await?;
     let uri = parse_s3_uri(&args.uri)?;
+    let context = AwsContext::new(globals).await?;
+    let client = bucket_client(&context, args.common.path_style, &uri.bucket).await;
     let size = tokio::fs::metadata(&args.src).await?.len();
     let options = PutOptions {
         content_type: args.content_type.clone(),
@@ -239,8 +277,9 @@ async fn put(globals: &Globals, args: &S3PutArgs) -> Result<()> {
 }
 
 async fn rm(globals: &Globals, args: &S3RmArgs) -> Result<()> {
-    let client = client(globals, args.common.path_style).await?;
     let uri = parse_s3_uri(&args.uri)?;
+    let context = AwsContext::new(globals).await?;
+    let client = bucket_client(&context, args.common.path_style, &uri.bucket).await;
     let keys = if args.recursive {
         list_objects(&client, &uri.bucket, &uri.dir_prefix())
             .await?
@@ -272,10 +311,12 @@ async fn rm(globals: &Globals, args: &S3RmArgs) -> Result<()> {
 }
 
 async fn cp(globals: &Globals, args: &S3CpArgs, action: &'static str) -> Result<()> {
-    let client = client(globals, args.common.path_style).await?;
     let src = parse_s3_uri(&args.src)?;
     let dst = parse_s3_uri(&args.dst)?;
-    let head = client
+    let context = AwsContext::new(globals).await?;
+    let src_client = bucket_client(&context, args.common.path_style, &src.bucket).await;
+    let dst_client = bucket_client(&context, args.common.path_style, &dst.bucket).await;
+    let head = src_client
         .head_object()
         .bucket(&src.bucket)
         .key(&src.key)
@@ -284,9 +325,18 @@ async fn cp(globals: &Globals, args: &S3CpArgs, action: &'static str) -> Result<
         .map_err(AwlError::sdk)?;
     let size = head.content_length().unwrap_or_default().max(0) as u64;
     let part_size = checked_part_size(args.transfer.part_size)?;
-    copy(&client, &src, &dst, size, part_size, Some(&head)).await?;
+    copy(
+        &src_client,
+        &dst_client,
+        &src,
+        &dst,
+        size,
+        part_size,
+        Some(&head),
+    )
+    .await?;
     if action == "mv" {
-        delete_keys(&client, &src.bucket, std::slice::from_ref(&src.key)).await?;
+        delete_keys(&src_client, &src.bucket, std::slice::from_ref(&src.key)).await?;
     }
     output::ack(
         globals,
@@ -302,8 +352,9 @@ async fn cp(globals: &Globals, args: &S3CpArgs, action: &'static str) -> Result<
 }
 
 async fn presign(globals: &Globals, args: &S3PresignArgs) -> Result<()> {
-    let client = client(globals, args.common.path_style).await?;
     let uri = parse_s3_uri(&args.uri)?;
+    let context = AwsContext::new(globals).await?;
+    let client = bucket_client(&context, args.common.path_style, &uri.bucket).await;
     let config = PresigningConfig::expires_in(args.expires).map_err(|error| AwlError::Usage {
         message: error.to_string(),
     })?;
@@ -333,8 +384,9 @@ async fn presign(globals: &Globals, args: &S3PresignArgs) -> Result<()> {
 }
 
 async fn du(globals: &Globals, args: &S3UriArgs) -> Result<()> {
-    let client = client(globals, args.common.path_style).await?;
     let uri = parse_s3_uri(&args.uri)?;
+    let context = AwsContext::new(globals).await?;
+    let client = bucket_client(&context, args.common.path_style, &uri.bucket).await;
     let prefix = uri.dir_prefix();
     let objects = list_objects(&client, &uri.bucket, &prefix).await?;
     output::emit(
@@ -349,8 +401,9 @@ async fn du(globals: &Globals, args: &S3UriArgs) -> Result<()> {
 }
 
 async fn head(globals: &Globals, args: &S3UriArgs) -> Result<()> {
-    let client = client(globals, args.common.path_style).await?;
     let uri = parse_s3_uri(&args.uri)?;
+    let context = AwsContext::new(globals).await?;
+    let client = bucket_client(&context, args.common.path_style, &uri.bucket).await;
     let response = client
         .head_object()
         .bucket(&uri.bucket)
@@ -397,7 +450,9 @@ async fn sync(globals: &Globals, args: &S3SyncArgs) -> Result<()> {
             message: "s3 sync requires at least one s3:// location".to_owned(),
         });
     }
-    let client = client(globals, args.common.path_style).await?;
+    let context = AwsContext::new(globals).await?;
+    let src_client = location_client(&context, args.common.path_style, &src).await;
+    let dst_client = location_client(&context, args.common.path_style, &dst).await;
     let filter = PathFilter::new(&args.include, &args.exclude)?;
     let part_size = checked_part_size(args.transfer.part_size)?;
     let dry_run = args.dry_run.dry_run;
@@ -410,8 +465,8 @@ async fn sync(globals: &Globals, args: &S3SyncArgs) -> Result<()> {
             message: format!("sync source {} is not a directory", root.display()),
         });
     }
-    let source = list_location(&client, &src).await?;
-    let destination = list_location(&client, &dst).await?;
+    let source = list_location(&src_client, &src).await?;
+    let destination = list_location(&dst_client, &dst).await?;
 
     let mut transfers = Vec::new();
     for (relative, entry) in &source {
@@ -445,9 +500,9 @@ async fn sync(globals: &Globals, args: &S3SyncArgs) -> Result<()> {
         );
     } else {
         let mut results = futures::stream::iter(transfers.into_iter().map(|(transfer, size)| {
-            let client = &client;
+            let (src_client, dst_client) = (&src_client, &dst_client);
             async move {
-                let error = run_transfer(client, &transfer, size, part_size)
+                let error = run_transfer(src_client, dst_client, &transfer, size, part_size)
                     .await
                     .err()
                     .map(|error| error.to_string());
@@ -474,7 +529,7 @@ async fn sync(globals: &Globals, args: &S3SyncArgs) -> Result<()> {
     // A failed or interrupted transfer pass means the source view is not fully
     // mirrored, so deleting would remove data that was never replaced.
     if failed == 0 {
-        rows.extend(delete_relative(&client, &dst, &deletes, dry_run).await?);
+        rows.extend(delete_relative(&dst_client, &dst, &deletes, dry_run).await?);
     }
 
     output::ack(globals, Output::many(rows)?)?;
@@ -512,17 +567,28 @@ fn transfer_for(src: &Location, dst: &Location, relative: &str) -> Result<Transf
 }
 
 async fn run_transfer(
-    client: &aws_sdk_s3::Client,
+    src_client: &aws_sdk_s3::Client,
+    dst_client: &aws_sdk_s3::Client,
     transfer: &Transfer,
     size: u64,
     part_size: u64,
 ) -> Result<()> {
     match transfer {
         Transfer::Upload { path, dst } => {
-            upload(client, path, dst, size, part_size, &PutOptions::default()).await
+            upload(
+                dst_client,
+                path,
+                dst,
+                size,
+                part_size,
+                &PutOptions::default(),
+            )
+            .await
         }
-        Transfer::Download { src, path } => download(client, src, path).await.map(|_| ()),
-        Transfer::Copy { src, dst } => copy(client, src, dst, size, part_size, None).await,
+        Transfer::Download { src, path } => download(src_client, src, path).await.map(|_| ()),
+        Transfer::Copy { src, dst } => {
+            copy(src_client, dst_client, src, dst, size, part_size, None).await
+        }
     }
 }
 
@@ -815,7 +881,10 @@ async fn upload(
     abort_on_error(client, dst, &upload_id, result).await
 }
 
+/// Copy `src` to `dst`. Requests go to the destination bucket's region;
+/// `src_client` is only used to read source metadata for multipart copies.
 async fn copy(
+    src_client: &aws_sdk_s3::Client,
     client: &aws_sdk_s3::Client,
     src: &S3Uri,
     dst: &S3Uri,
@@ -838,7 +907,7 @@ async fn copy(
     // Multipart copies do not carry metadata over on their own.
     let head = match head {
         Some(head) => head.clone(),
-        None => client
+        None => src_client
             .head_object()
             .bucket(&src.bucket)
             .key(&src.key)
@@ -851,6 +920,10 @@ async fn copy(
         .bucket(&dst.bucket)
         .key(&dst.key)
         .set_content_type(head.content_type().map(str::to_owned))
+        .set_content_encoding(head.content_encoding().map(str::to_owned))
+        .set_content_disposition(head.content_disposition().map(str::to_owned))
+        .set_content_language(head.content_language().map(str::to_owned))
+        .set_cache_control(head.cache_control().map(str::to_owned))
         .set_metadata(head.metadata().cloned())
         .send()
         .await

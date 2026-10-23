@@ -1,3 +1,5 @@
+use base64::Engine;
+
 use crate::cli::{Globals, SecretsCommand, SecretsSubcommand};
 use crate::client::AwsContext;
 use crate::error::{AwlError, Result};
@@ -37,15 +39,19 @@ pub async fn run(globals: &Globals, command: &SecretsCommand) -> Result<()> {
                 .send()
                 .await
                 .map_err(AwlError::sdk)?;
-            output::emit(
-                globals,
-                Output::one(serde_json::json!({
-                    "arn": response.arn(),
-                    "name": response.name(),
-                    "version_id": response.version_id(),
-                    "secret_string": response.secret_string(),
-                }))?,
-            )
+            let mut row = serde_json::json!({
+                "arn": response.arn(),
+                "name": response.name(),
+                "version_id": response.version_id(),
+                "secret_string": response.secret_string(),
+            });
+            // Binary secrets have no secret_string; only they get this field.
+            if let Some(binary) = response.secret_binary() {
+                row["secret_binary"] = base64::engine::general_purpose::STANDARD
+                    .encode(binary.as_ref())
+                    .into();
+            }
+            output::emit(globals, Output::One(row))
         }
         SecretsSubcommand::Put(args) => {
             let response = client

@@ -79,11 +79,13 @@ impl AwsContext {
         self.shared.endpoint_url()
     }
 
-    pub fn s3(&self, path_style: bool) -> aws_sdk_s3::Client {
-        let config = aws_sdk_s3::config::Builder::from(&self.shared)
-            .force_path_style(path_style)
-            .build();
-        aws_sdk_s3::Client::from_conf(config)
+    pub fn s3(&self, path_style: bool, region: Option<Region>) -> aws_sdk_s3::Client {
+        let mut config =
+            aws_sdk_s3::config::Builder::from(&self.shared).force_path_style(path_style);
+        if let Some(region) = region {
+            config = config.region(region);
+        }
+        aws_sdk_s3::Client::from_conf(config.build())
     }
 
     pub fn sqs(&self) -> aws_sdk_sqs::Client {
